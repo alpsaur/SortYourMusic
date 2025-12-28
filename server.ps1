@@ -24,6 +24,17 @@ $mimeTypes = @{
     ".ttf"  = "font/ttf"
 }
 
+# Read API key from config.js
+$configPath = Join-Path $webRoot "config.js"
+$configContent = Get-Content $configPath -Raw
+if ($configContent -match "GETSONGBPM_API_KEY\s*=\s*'([^']+)'") {
+    $apiKey = $matches[1]
+    Write-Host "GetSongBPM API key loaded"
+} else {
+    Write-Host "Warning: GetSongBPM API key not found in config.js"
+    $apiKey = ""
+}
+
 try {
     while ($listener.IsListening) {
         $context = $listener.GetContext()
@@ -31,6 +42,53 @@ try {
         $response = $context.Response
 
         $localPath = $request.Url.LocalPath
+
+        # Proxy for GetSongBPM API (to avoid CORS issues)
+        if ($localPath -eq "/api/bpm/search") {
+            # Search for song by artist and title
+            $query = $request.Url.Query
+            $params = [System.Web.HttpUtility]::ParseQueryString($query)
+            $artist = $params["artist"]
+            $title = $params["title"]
+
+            if ($artist -and $title -and $apiKey) {
+                try {
+                    $searchQuery = [System.Uri]::EscapeDataString("$artist $title")
+                    $apiUrl = "https://api.getsongbpm.com/search/?api_key=$apiKey&type=song&lookup=$searchQuery"
+
+                    $webClient = New-Object System.Net.WebClient
+                    $webClient.Encoding = [System.Text.Encoding]::UTF8
+                    $apiResponse = $webClient.DownloadString($apiUrl)
+
+                    $response.ContentType = "application/json"
+                    $response.Headers.Add("Access-Control-Allow-Origin", "*")
+                    $content = [System.Text.Encoding]::UTF8.GetBytes($apiResponse)
+                    $response.ContentLength64 = $content.Length
+                    $response.OutputStream.Write($content, 0, $content.Length)
+                    Write-Host "API /api/bpm/search?artist=$artist&title=$title - 200"
+                } catch {
+                    $response.StatusCode = 500
+                    $errMsg = @{ error = $_.Exception.Message } | ConvertTo-Json
+                    $content = [System.Text.Encoding]::UTF8.GetBytes($errMsg)
+                    $response.ContentType = "application/json"
+                    $response.ContentLength64 = $content.Length
+                    $response.OutputStream.Write($content, 0, $content.Length)
+                    Write-Host "API /api/bpm/search - 500: $($_.Exception.Message)"
+                }
+            } else {
+                $response.StatusCode = 400
+                $errMsg = @{ error = "Missing artist, title, or API key" } | ConvertTo-Json
+                $content = [System.Text.Encoding]::UTF8.GetBytes($errMsg)
+                $response.ContentType = "application/json"
+                $response.ContentLength64 = $content.Length
+                $response.OutputStream.Write($content, 0, $content.Length)
+                Write-Host "API /api/bpm/search - 400: Missing params"
+            }
+            $response.Close()
+            continue
+        }
+
+        # Serve static files
         if ($localPath -eq "/") { $localPath = "/index.html" }
 
         $filePath = Join-Path $webRoot $localPath.TrimStart("/")

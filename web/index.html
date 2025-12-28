@@ -635,6 +635,80 @@ function fetchAudioFeatures(ids) {
     });
 }
 
+// Fetch BPM from GetSongBPM API via local proxy
+function fetchBpmFromGetSongBPM(trackItems) {
+    var deferred = Q.defer();
+    var results = [];
+    var completed = 0;
+    var total = trackItems.length;
+
+    if (total === 0) {
+        deferred.resolve([]);
+        return deferred.promise;
+    }
+
+    info("Fetching BPM data... 0/" + total);
+
+    // Process tracks sequentially to avoid overwhelming the API
+    var index = 0;
+    function processNext() {
+        if (index >= trackItems.length) {
+            deferred.resolve(results);
+            return;
+        }
+
+        var item = trackItems[index];
+        index++;
+
+        if (!item.track || !item.track.artists || !item.track.artists[0]) {
+            results.push(null);
+            completed++;
+            info("Fetching BPM data... " + completed + "/" + total);
+            setTimeout(processNext, 50); // Small delay between requests
+            return;
+        }
+
+        var artist = item.track.artists[0].name;
+        var title = item.track.name;
+        var trackId = item.track.id;
+
+        $.ajax({
+            url: '/api/bpm/search',
+            data: { artist: artist, title: title },
+            timeout: 5000,
+            success: function(response) {
+                var audioFeature = null;
+                if (response && response.search && response.search.length > 0) {
+                    var song = response.search[0];
+                    audioFeature = {
+                        id: trackId,
+                        tempo: parseFloat(song.tempo) || 0,
+                        danceability: (parseFloat(song.danceability) || 0) / 100,
+                        acousticness: (parseFloat(song.acousticness) || 0) / 100,
+                        energy: null,
+                        loudness: null,
+                        valence: null,
+                        duration_ms: item.track.duration_ms
+                    };
+                }
+                results.push(audioFeature);
+                completed++;
+                info("Fetching BPM data... " + completed + "/" + total);
+                setTimeout(processNext, 100); // Rate limiting
+            },
+            error: function() {
+                results.push(null);
+                completed++;
+                info("Fetching BPM data... " + completed + "/" + total);
+                setTimeout(processNext, 100);
+            }
+        });
+    }
+
+    processNext();
+    return deferred.promise;
+}
+
 function fetchAlbums(ids) {
     var cids = ids.join(',');
     var url = "https://api.spotify.com/v1/albums";
@@ -791,6 +865,22 @@ function fetchPlaylistTracks(playlist) {
                 smartOrder(all_items);
                 clearTable();
                 updateTable(all_items);
+
+                // If Spotify audio features were empty, try GetSongBPM
+                var hasAudioFeatures = Object.keys(fmap).length > 0;
+                if (!hasAudioFeatures && all_items.length > 0) {
+                    console.log("Fetching BPM from GetSongBPM...");
+                    fetchBpmFromGetSongBPM(all_items).then(function(bpmResults) {
+                        _.each(bpmResults, function(bpmData, i) {
+                            if (bpmData && all_items[i] && all_items[i].track) {
+                                all_items[i].track.enInfo = bpmData;
+                            }
+                        });
+                        info("BPM data loaded");
+                        clearTable();
+                        updateTable(all_items);
+                    });
+                }
             }
         })
     }
