@@ -54,7 +54,7 @@ try {
             if ($artist -and $title -and $apiKey) {
                 try {
                     $searchQuery = [System.Uri]::EscapeDataString("$artist $title")
-                    $apiUrl = "https://api.getsongbpm.com/search/?api_key=$apiKey&type=song&lookup=$searchQuery"
+                    $apiUrl = "https://api.getsong.co/search/?api_key=$apiKey&type=song&lookup=$searchQuery"
 
                     $webClient = New-Object System.Net.WebClient
                     $webClient.Encoding = [System.Text.Encoding]::UTF8
