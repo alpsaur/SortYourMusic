@@ -635,72 +635,139 @@ function fetchAudioFeatures(ids) {
     });
 }
 
-// Fetch BPM from GetSongBPM API via local proxy
+// BPM Cache using localStorage
+var BPM_CACHE_KEY = 'sortyourmusic_bpm_cache';
+
+function getBpmCache() {
+    try {
+        var cached = localStorage.getItem(BPM_CACHE_KEY);
+        return cached ? JSON.parse(cached) : {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function saveBpmCache(cache) {
+    try {
+        localStorage.setItem(BPM_CACHE_KEY, JSON.stringify(cache));
+    } catch (e) {
+        console.warn('Failed to save BPM cache:', e);
+    }
+}
+
+function getBpmFromCache(trackId) {
+    var cache = getBpmCache();
+    return cache[trackId] || null;
+}
+
+function saveBpmToCache(trackId, bpmData) {
+    var cache = getBpmCache();
+    cache[trackId] = bpmData;
+    saveBpmCache(cache);
+}
+
+// Fetch BPM from GetSongBPM API via local proxy (with caching)
 function fetchBpmFromGetSongBPM(trackItems) {
     var deferred = Q.defer();
-    var results = [];
     var completed = 0;
+    var fetched = 0;
+    var cached = 0;
     var total = trackItems.length;
 
     if (total === 0) {
-        deferred.resolve([]);
+        deferred.resolve();
         return deferred.promise;
     }
 
-    info("Fetching BPM data... 0/" + total);
+    info("Loading BPM data... 0/" + total);
 
     // Process tracks sequentially to avoid overwhelming the API
     var index = 0;
     function processNext() {
         if (index >= trackItems.length) {
-            deferred.resolve(results);
+            info("BPM loaded (" + cached + " cached, " + fetched + " fetched)");
+            deferred.resolve();
             return;
         }
 
         var item = trackItems[index];
+        var currentIndex = index;
         index++;
 
         if (!item.track || !item.track.artists || !item.track.artists[0]) {
-            results.push(null);
             completed++;
-            info("Fetching BPM data... " + completed + "/" + total);
-            setTimeout(processNext, 50); // Small delay between requests
+            info("Loading BPM data... " + completed + "/" + total);
+            setTimeout(processNext, 10);
+            return;
+        }
+
+        var trackId = item.track.id;
+
+        // Check cache first
+        var cachedData = getBpmFromCache(trackId);
+        if (cachedData) {
+            item.track.enInfo = cachedData;
+            completed++;
+            cached++;
+            info("Loading BPM data... " + completed + "/" + total + " (cached)");
+            setTimeout(processNext, 10); // Fast for cached items
             return;
         }
 
         var artist = item.track.artists[0].name;
         var title = item.track.name;
-        var trackId = item.track.id;
 
         $.ajax({
             url: '/api/bpm/search',
             data: { artist: artist, title: title },
             timeout: 5000,
             success: function(response) {
-                var audioFeature = null;
+                var audioFeature = {
+                    id: trackId,
+                    tempo: 0,
+                    danceability: 0,
+                    acousticness: 0,
+                    energy: null,
+                    loudness: null,
+                    valence: null,
+                    duration_ms: item.track.duration_ms
+                };
+
                 if (response && response.search && response.search.length > 0) {
                     var song = response.search[0];
-                    audioFeature = {
-                        id: trackId,
-                        tempo: parseFloat(song.tempo) || 0,
-                        danceability: (parseFloat(song.danceability) || 0) / 100,
-                        acousticness: (parseFloat(song.acousticness) || 0) / 100,
-                        energy: null,
-                        loudness: null,
-                        valence: null,
-                        duration_ms: item.track.duration_ms
-                    };
+                    audioFeature.tempo = parseFloat(song.tempo) || 0;
+                    audioFeature.danceability = (parseFloat(song.danceability) || 0) / 100;
+                    audioFeature.acousticness = (parseFloat(song.acousticness) || 0) / 100;
                 }
-                results.push(audioFeature);
+
+                // Save to cache and apply to track
+                saveBpmToCache(trackId, audioFeature);
+                item.track.enInfo = audioFeature;
+
                 completed++;
-                info("Fetching BPM data... " + completed + "/" + total);
-                setTimeout(processNext, 100); // Rate limiting
+                fetched++;
+                info("Loading BPM data... " + completed + "/" + total);
+                setTimeout(processNext, 150); // Rate limiting for API calls
             },
             error: function() {
-                results.push(null);
+                // Save empty result to cache to avoid re-fetching
+                var emptyFeature = {
+                    id: trackId,
+                    tempo: 0,
+                    danceability: 0,
+                    acousticness: 0,
+                    energy: null,
+                    loudness: null,
+                    valence: null,
+                    duration_ms: item.track.duration_ms
+                };
+                saveBpmToCache(trackId, emptyFeature);
+                item.track.enInfo = emptyFeature;
+
                 completed++;
-                info("Fetching BPM data... " + completed + "/" + total);
-                setTimeout(processNext, 100);
+                fetched++;
+                info("Loading BPM data... " + completed + "/" + total);
+                setTimeout(processNext, 150);
             }
         });
     }
@@ -870,15 +937,11 @@ function fetchPlaylistTracks(playlist) {
                 var hasAudioFeatures = Object.keys(fmap).length > 0;
                 if (!hasAudioFeatures && all_items.length > 0) {
                     console.log("Fetching BPM from GetSongBPM...");
-                    fetchBpmFromGetSongBPM(all_items).then(function(bpmResults) {
-                        _.each(bpmResults, function(bpmData, i) {
-                            if (bpmData && all_items[i] && all_items[i].track) {
-                                all_items[i].track.enInfo = bpmData;
-                            }
-                        });
-                        info("BPM data loaded");
+                    fetchBpmFromGetSongBPM(all_items).then(function() {
+                        // BPM data is now applied to tracks, refresh the table
                         clearTable();
                         updateTable(all_items);
+                        saveState();
                     });
                 }
             }
