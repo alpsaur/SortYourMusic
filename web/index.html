@@ -303,27 +303,120 @@ function info(msg) {
     $("#info").text(msg);
 }
 
-function authorizeUser() {
-    var scopes = 'playlist-read-private playlist-modify-private playlist-modify-public';
+// PKCE Helpers (from Spotify docs, adapted for ES5 compatibility)
+function generateCodeVerifier() {
+    // Spotify: "cryptographic random string between 43-128 characters"
+    var possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    var array = new Uint8Array(64);
+    window.crypto.getRandomValues(array);
+    var verifier = '';
+    for (var i = 0; i < array.length; i++) {
+        verifier += possible.charAt(array[i] % possible.length);
+    }
+    return verifier;
+}
 
-    var url = 'https://accounts.spotify.com/authorize?client_id=' + SPOTIFY_CLIENT_ID +
-        '&response_type=token' +
-        '&scope=' + encodeURIComponent(scopes) +
-        '&redirect_uri=' + encodeURIComponent(SPOTIFY_REDIRECT_URI);
-    document.location = url;
+function sha256(plain) {
+    var encoder = new TextEncoder();
+    var data = encoder.encode(plain);
+    return window.crypto.subtle.digest('SHA-256', data);
+}
+
+function base64urlencode(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = '';
+    for (var i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    // Spotify: base64 with URL-safe characters, no padding
+    return btoa(binary)
+        .replace(/=/g, '')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
+}
+
+function authorizeUser() {
+    var codeVerifier = generateCodeVerifier();
+    localStorage.setItem('spotify_code_verifier', codeVerifier);
+
+    sha256(codeVerifier).then(function(hashed) {
+        var codeChallenge = base64urlencode(hashed);
+        var scopes = 'playlist-read-private playlist-modify-private playlist-modify-public';
+
+        var url = 'https://accounts.spotify.com/authorize' +
+            '?client_id=' + SPOTIFY_CLIENT_ID +
+            '&response_type=code' +
+            '&scope=' + encodeURIComponent(scopes) +
+            '&redirect_uri=' + encodeURIComponent(SPOTIFY_REDIRECT_URI) +
+            '&code_challenge_method=S256' +
+            '&code_challenge=' + codeChallenge;
+
+        window.location.href = url;
+    });
 }
 
 function parseArgs() {
+    var args = {};
+
+    // Check query string first (PKCE flow returns ?code=...)
+    var queryString = window.location.search.substring(1);
+    if (queryString) {
+        var queryPairs = queryString.split('&');
+        for (var i = 0; i < queryPairs.length; i++) {
+            var pair = queryPairs[i].split('=');
+            if (pair[0]) {
+                args[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1] || '');
+            }
+        }
+    }
+
+    // Also check hash (legacy implicit flow - backwards compatibility)
     var hash = location.hash.replace(/#/g, '');
     var all = hash.split('&');
-    var args = {};
     _.each(all, function(keyvalue) {
         var kv = keyvalue.split('=');
         var key = kv[0];
         var val = kv[1];
-        args[key] = val;
+        if (key) args[key] = val;
     });
+
     return args;
+}
+
+function exchangeCodeForToken(code, callback) {
+    var codeVerifier = localStorage.getItem('spotify_code_verifier');
+
+    if (!codeVerifier) {
+        callback('No code verifier found - please try logging in again', null);
+        return;
+    }
+
+    $.ajax({
+        url: 'https://accounts.spotify.com/api/token',
+        type: 'POST',
+        contentType: 'application/x-www-form-urlencoded',
+        data: {
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: SPOTIFY_REDIRECT_URI,
+            client_id: SPOTIFY_CLIENT_ID,
+            code_verifier: codeVerifier
+        },
+        success: function(response) {
+            localStorage.removeItem('spotify_code_verifier');
+            callback(null, response.access_token);
+        },
+        error: function(xhr) {
+            var errorMsg = 'Token exchange failed';
+            try {
+                var errData = JSON.parse(xhr.responseText);
+                errorMsg += ': ' + (errData.error_description || errData.error);
+            } catch(e) {
+                errorMsg += ': ' + xhr.status;
+            }
+            callback(errorMsg, null);
+        }
+    });
 }
 
 function callSpotify(type, url, json, callback) {
@@ -527,7 +620,19 @@ function formatDuration(dur) {
 function fetchAudioFeatures(ids) {
     var cids = ids.join(',');
     var url = "https://api.spotify.com/v1/audio-features";
-    return getSpotifyQ(url, { ids: cids});
+
+    // Wrap in a promise that catches 403 errors (API deprecated for new apps)
+    return Q.Promise(function(resolve, reject) {
+        getSpotifyQ(url, { ids: cids})
+            .then(function(data) {
+                resolve(data);
+            })
+            .catch(function(err) {
+                // Return empty audio_features array on failure (graceful degradation)
+                console.warn('Audio features unavailable (API deprecated for new apps):', err);
+                resolve({ audio_features: [] });
+            });
+    });
 }
 
 function fetchAlbums(ids) {
@@ -1026,13 +1131,45 @@ $(document).ready(
 
 
         if ('error' in args) {
-            error("Sorry, I can't read your playlists from Spotify without authorization");
+            error("Authorization error: " + (args.error_description || args.error));
             $("#go").show();
             $("#go").on('click', function() {
                 authorizeUser();
             });
+        } else if ('code' in args) {
+            // NEW: PKCE flow - exchange code for token
+            info("Logging in...");
+            $(".worker").hide();
+
+            exchangeCodeForToken(args['code'], function(err, token) {
+                if (err) {
+                    error(err);
+                    $("#go").show();
+                    $("#go").on('click', function() {
+                        authorizeUser();
+                    });
+                } else {
+                    // Clear URL params and proceed
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                    accessToken = token;
+                    // Save token for session persistence
+                    localStorage.setItem('spotify_access_token', token);
+
+                    fetchCurrentUserProfile(function(user) {
+                        if (user) {
+                            curUserID = user.id;
+                            $("#who").text(user.id);
+                            loadPlaylists(user.id);
+                        } else {
+                            error("Trouble getting the user profile");
+                        }
+                    });
+                }
+            });
         } else if ('access_token' in args) {
+            // LEGACY: Implicit flow (keep for backwards compatibility)
             accessToken = args['access_token'];
+            localStorage.setItem('spotify_access_token', accessToken);
             $(".worker").hide();
             fetchCurrentUserProfile(function(user) {
                 if (user) {
@@ -1043,7 +1180,26 @@ $(document).ready(
                     error("Trouble getting the user profile");
                 }
             });
+        } else if (localStorage.getItem('spotify_access_token')) {
+            // Restore session from localStorage
+            accessToken = localStorage.getItem('spotify_access_token');
+            $(".worker").hide();
+            fetchCurrentUserProfile(function(user) {
+                if (user) {
+                    curUserID = user.id;
+                    $("#who").text(user.id);
+                    loadPlaylists(user.id);
+                } else {
+                    // Token expired or invalid - clear and show login
+                    localStorage.removeItem('spotify_access_token');
+                    $("#go").show();
+                    $("#go").on('click', function() {
+                        authorizeUser();
+                    });
+                }
+            });
         } else {
+            // No auth params - show login button
             $("#go").show();
             $("#go").on('click', function() {
                 authorizeUser();
